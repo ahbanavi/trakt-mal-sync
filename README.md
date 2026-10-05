@@ -158,8 +158,28 @@ Process environment variables win over the `--config` file.
 Anime mappings by [anibridge/anibridge-mappings](https://github.com/anibridge/anibridge-mappings)
 (MIT) and [Fribb/anime-lists](https://github.com/Fribb/anime-lists), both built on
 [Anime-Lists/anime-lists](https://github.com/Anime-Lists/anime-lists) and
-[manami-project/anime-offline-database](https://github.com/manami-project/anime-offline-database). Not affiliated with Trakt or
-MyAnimeList.
+[manami-project/anime-offline-database](https://github.com/manami-project/anime-offline-database).
+Not affiliated with Trakt or MyAnimeList.
+
+### Related projects
+
+Other Trakt-to-MAL work looked at while building this. No code was taken from any of them, but
+they shaped its design:
+
+- [aniTrakt](https://anitrakt.huere.net/): the original Trakt-to-MAL sync and its Trakt ↔ MAL
+  table, now unmaintained. The table lives on in
+  [rensetsu/db.trakt.anitrakt](https://github.com/rensetsu/db.trakt.anitrakt) (archived), and
+  [rensetsu/BetterAnimeTraktMapper](https://github.com/rensetsu/BetterAnimeTraktMapper) (archived)
+  tackled its episode-order gaps.
+- [alexborovkov/anime-sync](https://github.com/alexborovkov/anime-sync): a browser-based,
+  two-way Trakt ↔ MAL sync. This project went the other way: one-way, unattended, with Trakt
+  left read only.
+- [s-afrid/trakt-sync-engine](https://github.com/s-afrid/trakt-sync-engine): Trakt to MAL and
+  Letterboxd, which also resolves ids through Fribb's mapping.
+- [eliasbenb/PlexAniBridge-Mappings](https://github.com/eliasbenb/PlexAniBridge-Mappings)
+  (archived): the per-season TMDB episode mappings that led to anibridge-mappings.
+- [TheXEM](https://thexem.info/): the scene ↔ TVDB numbering map that Sonarr uses. It was
+  considered, but it is keyed on TVDB while Trakt numbers by TMDB.
 
 ## License
 
