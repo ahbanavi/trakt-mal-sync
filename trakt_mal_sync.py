@@ -7,8 +7,9 @@ profile for that reason.
 
 MAL is written through the official API v2 with an OAuth token from a PKCE login.
 
-Anime are matched through Fribb's anime-lists mapping, which links TMDB show + season (+ episode
-offset) to MAL ids. Trakt numbers seasons the TMDB way, so the two line up.
+Trakt numbers episodes the TMDB way. Each one is placed on a MAL entry and episode through
+anibridge-mappings (explicit TMDB to MAL episode ranges), then air dates, then Fribb's anime-lists
+(TMDB season + episode offset). See resolve_show().
 
 Usage:
   trakt_mal_sync.py login-url              # print the MAL authorize URL
@@ -36,22 +37,30 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 TRAKT_API = "https://api.trakt.tv"
 MAL_API = "https://api.myanimelist.net/v2"
 MAL_OAUTH = "https://myanimelist.net/v1/oauth2"
 FRIBB_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
+ANIBRIDGE_URL = (
+    "https://github.com/anibridge/anibridge-mappings/releases/download/v3/mappings.min.json"
+)
 USER_AGENT = f"trakt-mal-sync/{__version__} (+https://github.com/ahbanavi/trakt-mal-sync)"
 
 MAPPING_MAX_AGE = 6 * 86400  # re-download the mapping when older than this
 ANIME_INFO_MAX_AGE = 6 * 86400  # re-fetch MAL details of unfinished anime after this
 MAL_DELAY = 0.5  # seconds between MAL calls
 TYPE_RANK = {"TV": 0, "ONA": 1, "OVA": 2, "SPECIAL": 3, "MOVIE": 4}
+# MAL media types an episode can belong to when matched by air date
+REGULAR_TYPES = {"tv", "ona"}
+SPECIAL_TYPES = {"ova", "ona", "special", "tv_special", "movie"}
+JST = dt.timezone(dt.timedelta(hours=9))  # MAL dates are Japanese air dates
 MAL_LIST_FIELDS = (
     "list_status{status,score,num_episodes_watched,is_rewatching,start_date,finish_date,updated_at},"
-    "num_episodes,status,media_type"
+    "num_episodes,status,media_type,start_date,end_date"
 )
+ANIME_FIELDS = ("title", "num_episodes", "status", "media_type", "start_date", "end_date")
 TELEGRAM_LIMIT = 4000
 
 
@@ -203,10 +212,14 @@ class Trakt:
     def profile(self) -> dict:
         return self.get(self.user, extended="full").json()
 
-    def show_seasons(self, trakt_id: int) -> set[int]:
-        """Season numbers Trakt lists for a show, ignoring empty ones."""
-        seasons = self.get(f"shows/{trakt_id}/seasons", extended="full").json()
-        return {s["number"] for s in seasons if s.get("episode_count")}
+    def show_episodes(self, trakt_id: int) -> list[tuple[int, int, str | None]]:
+        """Every episode Trakt lists for a show, as (season, number, first_aired)."""
+        seasons = self.get(f"shows/{trakt_id}/seasons", extended="episodes,full").json()
+        return [
+            (s["number"], e["number"], e.get("first_aired"))
+            for s in seasons
+            for e in s.get("episodes") or []
+        ]
 
     def pages(self, path: str, **params) -> list:
         """All pages of a list under the user, e.g. pages("history/episodes")."""
@@ -320,7 +333,7 @@ class Mal:
 
     def anime(self, mal_id: int) -> dict | None:
         r = self._call(
-            "GET", f"{MAL_API}/anime/{mal_id}", params={"fields": "num_episodes,status,media_type"}
+            "GET", f"{MAL_API}/anime/{mal_id}", params={"fields": ",".join(ANIME_FIELDS[1:])}
         )
         if r.status_code == 404:
             return None
@@ -349,38 +362,54 @@ class Mapping:
     tv: dict[tuple[int, int], list[tuple[int, int, str]]] = field(
         default_factory=lambda: defaultdict(list)
     )
+    # (tmdb show, tmdb season) -> [(TMDB episode range, MAL episode range, mal id)], from anibridge
+    ranges: dict[tuple[int, int], list[tuple[str, str, int]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
     movies: dict[int, int] = field(default_factory=dict)  # tmdb movie -> mal id
     shows: set[int] = field(default_factory=set)  # tmdb shows known to be anime
-    seasons: dict[int, list[int]] = field(default_factory=dict)  # tmdb show -> mapped seasons
+    seasons: dict[int, set[int]] = field(default_factory=dict)  # tmdb show -> mapped seasons
+    by_tmdb: dict[int, set[int]] = field(default_factory=lambda: defaultdict(set))
+    by_tvdb: dict[int, set[int]] = field(default_factory=lambda: defaultdict(set))
     skip: set[int] = field(default_factory=set)  # mal ids never touched
 
 
+def fetch_cached(cfg: Config, name: str, url: str, log) -> Path:
+    """A mapping file in the state dir, re-downloaded when older than MAPPING_MAX_AGE."""
+    path = cfg.state_dir / name
+    if path.exists() and time.time() - path.stat().st_mtime < MAPPING_MAX_AGE:
+        return path
+    try:
+        r = requests.get(url, timeout=300, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        json.loads(r.content)  # refuse to cache a broken download
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(r.content)
+        os.replace(tmp, path)
+    except (requests.RequestException, ValueError) as e:
+        if not path.exists():
+            raise SyncError(f"cannot download {name}: {e}")
+        log(f"warning: {name} download failed ({e}); using the cached copy")
+    return path
+
+
 def load_mapping(cfg: Config, log) -> Mapping:
-    path = cfg.state_dir / "anime-list-full.json"
-    fresh = path.exists() and time.time() - path.stat().st_mtime < MAPPING_MAX_AGE
-    if not fresh:
-        try:
-            r = requests.get(FRIBB_URL, timeout=120, headers={"User-Agent": USER_AGENT})
-            r.raise_for_status()
-            data = r.json()
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data))
-            os.replace(tmp, path)
-        except (requests.RequestException, ValueError) as e:
-            if not path.exists():
-                raise SyncError(f"cannot download the anime mapping: {e}")
-            log(f"warning: mapping download failed ({e}); using the cached copy")
     m = Mapping()
     multi_movie: dict[int, set[int]] = defaultdict(set)
-    for e in json.loads(path.read_text()):
+    for e in json.loads(fetch_cached(cfg, "anime-list-full.json", FRIBB_URL, log).read_text()):
         mal_id = e.get("mal_id")
+        if not mal_id:
+            continue
+        if isinstance(e.get("tvdb_id"), int):
+            m.by_tvdb[e["tvdb_id"]].add(mal_id)
         tmdb = e.get("themoviedb_id")
-        if not mal_id or not isinstance(tmdb, dict):
+        if not isinstance(tmdb, dict):
             continue
         season = (e.get("season") or {}).get("tmdb")
         offset = (e.get("episode_offset") or {}).get("tmdb") or 0
         for show in as_list(tmdb.get("tv")):
             m.shows.add(show)
+            m.by_tmdb[show].add(mal_id)
             if isinstance(season, int):
                 m.tv[(show, season)].append((offset, mal_id, e.get("type") or ""))
         for movie in as_list(tmdb.get("movie")):
@@ -388,21 +417,51 @@ def load_mapping(cfg: Config, log) -> Mapping:
     # a TMDB movie that maps to several MAL entries is ambiguous, so it is left out
     m.movies = {k: next(iter(v)) for k, v in multi_movie.items() if len(v) == 1}
 
+    raw = json.loads(fetch_cached(cfg, "anibridge-mappings.json", ANIBRIDGE_URL, log).read_text())
+    for key, targets in raw.items():
+        kind, _, rest = key.partition(":")
+        mals = [int(t[4:]) for t in targets if t.startswith("mal:")]
+        if kind == "tmdb_show" and mals:
+            show_id, _, scope = rest.partition(":")
+            if not scope.startswith("s") or not scope[1:].isdigit():
+                continue
+            show, season = int(show_id), int(scope[1:])
+            for t, pairs in targets.items():
+                if t.startswith("mal:"):
+                    for src, dst in pairs.items():
+                        m.ranges[(show, season)].append((src, dst, int(t[4:])))
+            m.shows.add(show)
+            m.by_tmdb[show].update(mals)
+        elif kind == "tvdb_show" and mals and rest.partition(":")[0].isdigit():
+            m.by_tvdb[int(rest.partition(":")[0])].update(mals)  # air-date candidates only
+        elif kind == "tmdb_movie" and len(mals) == 1 and rest.isdigit():
+            m.movies[int(rest)] = mals[0]  # anibridge wins over Fribb
+    del raw
+
     overrides = read_json(cfg.overrides_file, {}) if cfg.overrides_file else {}
     replaced = set()
     for o in overrides.get("tv", []):
         key = (int(o["tmdb"]), int(o["season"]))
         if key not in replaced:
             m.tv[key] = []
+            m.ranges.pop(key, None)
             replaced.add(key)
         m.tv[key].append((int(o.get("offset", 0)), int(o["mal_id"]), "OVERRIDE"))
         m.shows.add(key[0])
+        m.by_tmdb[key[0]].add(int(o["mal_id"]))
     for o in overrides.get("movies", []):
         m.movies[int(o["tmdb"])] = int(o["mal_id"])
     m.skip = {int(x) for x in overrides.get("skip_mal", [])}
-    for show, season in m.tv:
-        m.seasons.setdefault(show, []).append(season)
+    for show, season in list(m.tv) + list(m.ranges):
+        m.seasons.setdefault(show, set()).add(season)
     return m
+
+
+def season_mal_ids(m: Mapping, key: tuple[int, int]) -> list[int]:
+    """MAL entries mapped to one TMDB season, from both mappings."""
+    ids = [mal_id for _, _, mal_id in m.ranges.get(key, [])]
+    ids += [mal_id for _, mal_id in segments(m, key)[0]]
+    return [i for i in dict.fromkeys(ids) if i not in m.skip]
 
 
 def watchlist_keys(d: TraktData, m: Mapping) -> list[tuple[int, int]]:
@@ -454,6 +513,8 @@ class TraktData:
     anime_genre: dict = field(default_factory=dict)  # tmdb show -> title, for "anime" genre
     no_tmdb: list = field(default_factory=list)  # titles of anime-genre shows lacking a TMDB id
     trakt_ids: dict = field(default_factory=dict)  # tmdb show -> trakt show id
+    tvdb_ids: dict = field(default_factory=dict)  # tmdb show -> tvdb show id
+    show_eps: dict = field(default_factory=dict)  # tmdb show -> [(season, number, first_aired)]
     # Plays before this are not real watch dates: "watched on release date" marks and the bulk
     # import done when the account was new. They still count as watched.
     date_cutoff: str = ""
@@ -473,6 +534,7 @@ def load_trakt(cfg: Config, t: Trakt, log) -> TraktData:
         d.episodes[(tmdb, ep["season"])][ep["number"]].append(h["watched_at"])
         d.titles[("show", tmdb)] = show["title"]
         d.trakt_ids[tmdb] = show["ids"]["trakt"]
+        d.tvdb_ids[tmdb] = show["ids"].get("tvdb")
     for h in t.pages("history/movies"):
         tmdb = h["movie"]["ids"].get("tmdb")
         if tmdb:
@@ -530,6 +592,10 @@ class Want:
     score: int | None = None
     score_rank: int = 9  # lower wins: 0 season or movie rating, 1 show rating
     watchlist: bool = False
+    # Trakt episodes that map here: all aired ones, and the watched ones. Only counted when the
+    # show's full episode list is known.
+    mapped_total: int = 0
+    mapped_watched: set = field(default_factory=set)
 
     def rate(self, score: int | None, rank: int) -> None:
         if score and rank < self.score_rank:
@@ -581,9 +647,169 @@ def fold_later_seasons(segs: list[tuple[int, int]], pool: list[int], n_eps) -> l
     return out
 
 
-def collect_wants(
-    cfg: Config, d: TraktData, m: Mapping, info: dict, trakt_seasons, report: Report
-) -> dict:
+def parse_range(text: str) -> tuple[int, int | None]:
+    """anibridge range "a-b", "a" or open-ended "a-" as (first, last or None)."""
+    first, dash, last = text.strip().partition("-")
+    if not dash:
+        return int(first), int(first)
+    return int(first), int(last) if last else None
+
+
+def range_targets(src: str, dst: str, number: int) -> list[int]:
+    """MAL episode numbers that one anibridge range gives a TMDB episode ([] if outside it).
+
+    dst may list several ranges ("1-12,14-20") and a ratio: "|2" folds two TMDB episodes into
+    one MAL episode, "|-3" spreads one TMDB episode over three.
+    """
+    first, last = parse_range(src)
+    if number < first or (last is not None and number > last):
+        return []
+    spec, _, ratio_text = dst.partition("|")
+    ratio = int(ratio_text) if ratio_text.lstrip("-").isdigit() else 1
+    ratio = ratio or 1
+    pos = number - first
+    start, count = (pos // ratio, 1) if ratio > 0 else (pos * -ratio, -ratio)
+    parts = [parse_range(p) for p in spec.split(",")]
+    out = []
+    for k in range(start, start + count):
+        rest = k
+        for a, b in parts:
+            if b is None or rest <= b - a:
+                out.append(a + rest)
+                break
+            rest -= b - a + 1
+    return out
+
+
+def mal_date(text: str | None, last: bool = False) -> dt.date | None:
+    """A MAL date, which may be just "YYYY-MM" or "YYYY"; last=True rounds up."""
+    if not text:
+        return None
+    parts = [int(p) for p in text.split("-")]
+    if len(parts) == 3:
+        return dt.date(*parts)
+    year, month = parts[0], parts[1] if len(parts) == 2 else (12 if last else 1)
+    if not last:
+        return dt.date(year, month, 1)
+    return dt.date(year + month // 12, month % 12 + 1, 1) - dt.timedelta(days=1)
+
+
+def airing_window(a: dict, today: dt.date) -> tuple[dt.date, dt.date] | None:
+    """The dates a MAL entry aired on, with a day of slack each side."""
+    start = mal_date(a.get("start_date"))
+    if not start or a.get("status") == "not_yet_aired":
+        return None
+    end = mal_date(a.get("end_date"), last=True)
+    if end is None:
+        if a.get("status") == "currently_airing":
+            end = today + dt.timedelta(days=7)
+        elif a.get("num_episodes"):
+            end = start + dt.timedelta(days=7 * a["num_episodes"])
+        else:
+            return None
+    return start - dt.timedelta(days=1), end + dt.timedelta(days=1)
+
+
+def aired_on(ts: str) -> dt.date:
+    return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(JST).date()
+
+
+@dataclass
+class ShowMap:
+    episodes: dict = field(default_factory=dict)  # (season, number) -> [(mal_id, MAL episode)]
+    totals: dict = field(default_factory=lambda: defaultdict(int))  # mal_id -> aired episodes
+
+
+def resolve_show(
+    cfg: Config, m: Mapping, info: dict, tmdb: int, tvdb: int | None, eps: list, today: dt.date
+) -> ShowMap:
+    """Place every Trakt episode of one show on a MAL entry and episode.
+
+    Three sources, first hit wins per episode:
+    1. anibridge's explicit TMDB episode ranges.
+    2. Air dates: the one MAL entry of the show whose airing window holds the episode's air date;
+       the episode's rank among the season's episodes in that window is its MAL number. An entry
+       that anibridge maps within this same season is left to anibridge.
+    3. Fribb's season + episode offset, with later seasons folded in (fold_later_seasons).
+
+    anibridge only counts for seasons Trakt actually has: TMDB often folds a later season into
+    season 1 after the mapping was made, which leaves the mapping's season 2 empty on Trakt.
+    """
+    sm = ShowMap()
+
+    def n_eps(mal_id: int) -> int:
+        return (info.get(mal_id) or {}).get("num_episodes") or 0
+
+    wanted = [(s, n, ts) for s, n, ts in eps if s > 0 or cfg.sync_specials]
+    on_trakt = {s for s, _, _ in eps}
+    exact_in = {s: {mal_id for _, _, mal_id in m.ranges.get((tmdb, s), [])} for s in on_trakt}
+    exact = set().union(*exact_in.values())
+    for s, n, _ in wanted:
+        hits = [
+            (mal_id, idx)
+            for src, dst, mal_id in m.ranges.get((tmdb, s), [])
+            if mal_id not in m.skip
+            for idx in range_targets(src, dst, n)
+        ]
+        if hits:
+            sm.episodes[(s, n)] = hits
+
+    cands = []
+    for mal_id in (m.by_tmdb.get(tmdb, set()) | m.by_tvdb.get(tvdb, set())) - m.skip:
+        a = info.get(mal_id) or {}
+        window = airing_window(a, today)
+        if window:
+            cands.append((mal_id, window, a.get("media_type")))
+
+    def matching(season: int, day: dt.date) -> list[int]:
+        kinds = REGULAR_TYPES if season > 0 else SPECIAL_TYPES
+        return [mal_id for mal_id, (lo, hi), kind in cands if kind in kinds and lo <= day <= hi]
+
+    dated = [(s, n, aired_on(ts)) for s, n, ts in wanted if ts]
+    in_window: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for s, n, day in dated:
+        for mal_id in matching(s, day):
+            in_window[(mal_id, s)].append(n)
+    for s, n, day in dated:
+        hit = matching(s, day)
+        if (s, n) in sm.episodes or len(hit) != 1 or hit[0] in exact_in[s]:
+            continue
+        idx = sorted(in_window[(hit[0], s)]).index(n) + 1
+        if not n_eps(hit[0]) or idx <= n_eps(hit[0]):
+            sm.episodes[(s, n)] = [(hit[0], idx)]
+
+    for season in sorted({s for s, _, _ in wanted}):
+        left = [n for s, n, _ in wanted if s == season and (s, n) not in sm.episodes]
+        if not left:
+            continue
+        segs = [(o, mal_id) for o, mal_id in segments(m, (tmdb, season))[0] if mal_id not in exact]
+        later = [s for s in sorted(m.seasons.get(tmdb, [])) if s > season]
+        if season > 0 and later and any(locate(segs, n, n_eps) is None for n in left):
+            pool = [
+                mal_id
+                for s in later
+                if s not in on_trakt
+                for _, mal_id in segments(m, (tmdb, s))[0]
+                if mal_id not in exact
+                and (info.get(mal_id) or {}).get("status") != "not_yet_aired"
+            ]
+            segs = fold_later_seasons(segs, pool, n_eps)
+        for n in left:
+            if found := locate(segs, n, n_eps):
+                sm.episodes[(season, n)] = [found]
+
+    for s, n, ts in wanted:
+        if ts and aired_on(ts) <= today:
+            for mal_id, _ in sm.episodes.get((s, n), []):
+                sm.totals[mal_id] += 1
+    return sm
+
+
+def is_anime(m: Mapping, d: TraktData, tmdb: int) -> bool:
+    return tmdb in m.shows or d.tvdb_ids.get(tmdb) in m.by_tvdb
+
+
+def collect_wants(cfg: Config, d: TraktData, m: Mapping, info: dict, report: Report) -> dict:
     wants: dict[int, Want] = {}
 
     def want(mal_id: int) -> Want:
@@ -592,46 +818,43 @@ def collect_wants(
     def n_eps(mal_id: int) -> int:
         return (info.get(mal_id) or {}).get("num_episodes") or 0
 
-    for key, eps in sorted(d.episodes.items()):
-        tmdb, season = key
-        if season == 0 and not cfg.sync_specials:
+    today = dt.datetime.now(JST).date()
+    for tmdb in sorted({t for t, _ in d.episodes}):
+        if not is_anime(m, d, tmdb):
             continue
         title = d.titles.get(("show", tmdb), str(tmdb))
-        segs, notes = segments(m, key)
-        for note in notes:
-            report.unmapped.append(f"{title} S{season}: {note}")
-        if not segs:
-            if season > 0 and (tmdb in m.shows or tmdb in d.anime_genre):
-                report.unmapped.append(f"{title} S{season}: no MAL mapping (tmdb {tmdb})")
-            continue
-        later = [s for s in sorted(m.seasons.get(tmdb, [])) if s > season]
-        if season > 0 and later and any(locate(segs, n, n_eps) is None for n in eps):
-            on_trakt = trakt_seasons(tmdb)
-            pool = [
-                mal_id
-                for s in later
-                if s not in on_trakt
-                for _, mal_id in segments(m, (tmdb, s))[0]
-                if (info.get(mal_id) or {}).get("status") != "not_yet_aired"
-            ]
-            segs = fold_later_seasons(segs, pool, n_eps)
-        uncovered = []
-        for number, plays in sorted(eps.items()):
-            found = locate(segs, number, n_eps)
-            if found is None:
-                uncovered.append(number)
+        watched = {s: eps for (t, s), eps in d.episodes.items() if t == tmdb}
+        full = tmdb in d.show_eps
+        eps = list(d.show_eps.get(tmdb, []))
+        known = {(s, n) for s, n, _ in eps}
+        eps += [(s, n, None) for s, e in watched.items() for n in e if (s, n) not in known]
+        sm = resolve_show(cfg, m, info, tmdb, d.tvdb_ids.get(tmdb), eps, today)
+        for season, season_eps in sorted(watched.items()):
+            if season == 0 and not cfg.sync_specials:
                 continue
-            mal_id, idx = found
-            w = want(mal_id)
-            w.episodes[idx].extend(plays)
-            src = f"{title} S{season}"
-            if src not in w.sources:
-                w.sources.append(src)
-                w.rate(d.season_ratings.get(key), 0)
-                if season > 0:
-                    w.rate(d.show_ratings.get(tmdb), 1)
-        if uncovered and season > 0:
-            report.unmapped.append(f"{title} S{season}: episodes {compact(uncovered)} not mapped")
+            uncovered = []
+            for number, plays in sorted(season_eps.items()):
+                hits = sm.episodes.get((season, number))
+                if not hits:
+                    uncovered.append(number)
+                    continue
+                for mal_id, idx in hits:
+                    w = want(mal_id)
+                    w.episodes[idx].extend(plays)
+                    w.mapped_watched.add((tmdb, season, number))
+                    src = f"{title} S{season}"
+                    if src not in w.sources:
+                        w.sources.append(src)
+                        w.rate(d.season_ratings.get((tmdb, season)), 0)
+                        if season > 0:
+                            w.rate(d.show_ratings.get(tmdb), 1)
+            if uncovered and season > 0:
+                report.unmapped.append(
+                    f"{title} S{season}: episodes {compact(uncovered)} not mapped (tmdb {tmdb})"
+                )
+        for mal_id, total in sm.totals.items():
+            if mal_id in wants and full:
+                wants[mal_id].mapped_total += total
 
     for tmdb, plays in d.movies.items():
         mal_id = m.movies.get(tmdb)
@@ -644,7 +867,7 @@ def collect_wants(
 
     if cfg.sync_watchlist:
         for tmdb, season in watchlist_keys(d, m):
-            for _, mal_id in segments(m, (tmdb, season))[0]:
+            for mal_id in season_mal_ids(m, (tmdb, season)):
                 w = want(mal_id)
                 w.watchlist = True
                 w.sources.append(f"{d.titles.get(('show', tmdb), tmdb)} S{season} (watchlist)")
@@ -686,7 +909,14 @@ def target(cfg: Config, w: Want, node: dict, cutoff: str) -> dict | None:
     first_plays = {i: ts for i, ts in first_plays.items() if not total or i <= total}
     watched = list(first_plays)
     if watched:
-        complete = bool(total) and len(watched) >= total and finished
+        # Every Trakt episode that maps here is watched: complete, even when MAL counts a bonus
+        # episode or two that TMDB files elsewhere (K-On! is 12 on TMDB, 13 on MAL).
+        all_mapped = (
+            w.mapped_total > 0
+            and len(w.mapped_watched) >= w.mapped_total
+            and w.mapped_total >= total - max(2, total // 10)
+        )
+        complete = bool(total) and finished and (len(watched) >= total or all_mapped)
         t = {"status": "completed" if complete else "watching"}
         if complete:
             t["num_watched_episodes"] = total
@@ -768,18 +998,17 @@ def describe(node: dict, fields: dict) -> str:
 
 
 def anime_info(mal: Mal, cfg: Config, ids: set[int], mylist: dict, log) -> dict:
-    """num_episodes/status/title per MAL id, from the list itself or a cached details call."""
+    """Episode count, status, type and air dates per MAL id, from the list or a cached call."""
     cache_file = cfg.state_dir / "mal_anime.json"
     cache = {int(k): v for k, v in (read_json(cache_file, {}) or {}).items()}
     now = int(time.time())
     for mal_id, node in mylist.items():
-        cache[mal_id] = {
-            k: node.get(k) for k in ("title", "num_episodes", "status", "media_type")
-        } | {"fetched": now}
+        cache[mal_id] = {k: node.get(k) for k in ANIME_FIELDS} | {"fetched": now}
     missing = [
         i
         for i in sorted(ids)
         if i not in cache
+        or (not cache[i].get("missing") and "end_date" not in cache[i])
         or (
             cache[i].get("status") != "finished_airing"
             and now - cache[i].get("fetched", 0) > ANIME_INFO_MAX_AGE
@@ -792,9 +1021,7 @@ def anime_info(mal: Mal, cfg: Config, ids: set[int], mylist: dict, log) -> dict:
         if a is None:
             cache[mal_id] = {"title": None, "missing": True, "fetched": now}
             continue
-        cache[mal_id] = {
-            k: a.get(k) for k in ("title", "num_episodes", "status", "media_type")
-        } | {"fetched": now}
+        cache[mal_id] = {k: a.get(k) for k in ANIME_FIELDS} | {"fetched": now}
     write_json(cache_file, {str(k): v for k, v in cache.items()}, mode=0o644)
     return cache
 
@@ -815,28 +1042,27 @@ def sync(cfg: Config, apply: bool, only: set[int] | None = None) -> int:
     mylist = mal.animelist()
     log(f"MAL: {len(mylist)} entries on the list")
 
-    # candidate MAL ids first, so episode counts are known before episodes are assigned
+    # every anime show's full episode list, for air dates and "all episodes watched"
+    shows = sorted({t for t, _ in data.episodes if is_anime(mapping, data, t)})
+    for tmdb in shows:
+        try:
+            data.show_eps[tmdb] = trakt.show_episodes(data.trakt_ids[tmdb])
+        except SyncError as e:
+            log(f"warning: no episode list for {data.titles.get(('show', tmdb), tmdb)}: {e}")
+    log(f"Trakt: episode lists of {len(data.show_eps)} anime shows")
+
+    # candidate MAL ids first, so episode counts and air dates are known before matching
     ids = set()
-    for tmdb, season in data.episodes:
-        # later seasons too: they may be folded into this one (fold_later_seasons)
-        for s in mapping.seasons.get(tmdb, []) if season > 0 else [season]:
-            if s >= season:
-                ids.update(mal_id for _, mal_id in segments(mapping, (tmdb, s))[0])
+    for tmdb in shows:
+        ids |= mapping.by_tmdb.get(tmdb, set()) | mapping.by_tvdb.get(data.tvdb_ids.get(tmdb), set())
     ids.update(mapping.movies[t] for t in data.movies if t in mapping.movies)
     if cfg.sync_watchlist:
         for key in watchlist_keys(data, mapping):
-            ids.update(mal_id for _, mal_id in segments(mapping, key)[0])
+            ids.update(season_mal_ids(mapping, key))
         ids.update(mapping.movies[t] for t in data.watchlist_movies if t in mapping.movies)
-    info = anime_info(mal, cfg, ids, mylist, log)
+    info = anime_info(mal, cfg, ids - mapping.skip, mylist, log)
 
-    seasons_cache: dict[int, set[int]] = {}
-
-    def trakt_seasons(tmdb: int) -> set[int]:
-        if tmdb not in seasons_cache:
-            seasons_cache[tmdb] = trakt.show_seasons(data.trakt_ids[tmdb])
-        return seasons_cache[tmdb]
-
-    wants = collect_wants(cfg, data, mapping, info, trakt_seasons, report)
+    wants = collect_wants(cfg, data, mapping, info, report)
     planned = []
     for mal_id, w in sorted(wants.items()):
         node = mylist.get(mal_id) or {"id": mal_id, **(info.get(mal_id) or {})}
@@ -851,7 +1077,7 @@ def sync(cfg: Config, apply: bool, only: set[int] | None = None) -> int:
     unmapped_anime = [
         f"{title}: anime on Trakt with no MAL mapping (tmdb {tmdb})"
         for tmdb, title in sorted(data.anime_genre.items(), key=lambda x: x[1])
-        if tmdb not in mapping.shows
+        if not is_anime(mapping, data, tmdb)
     ] + [f"{title}: anime on Trakt without a TMDB id" for title in data.no_tmdb]
     report.unmapped.extend(unmapped_anime)
 

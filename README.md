@@ -35,15 +35,29 @@ Rules that keep it from damaging a list you already maintain:
 
 ## How anime are matched
 
-Trakt numbers seasons the way TMDB does, and [Fribb/anime-lists](https://github.com/Fribb/anime-lists)
-maps a TMDB show + season (+ episode offset) to MAL ids. So TMDB season 1, episodes 1-12 can become
-one MAL entry and episodes 13-24 another. The mapping is downloaded once a week and cached.
+Trakt numbers seasons the way TMDB does, while MAL gives every season, cour and special its own
+entry. Each episode on Trakt is placed on a MAL entry and episode by the first of three sources
+that knows it:
 
-TMDB often folds a show's later cours into one long season while the mapping still files them
-under season 2, 3, ... When episodes run past a season's last mapped entry, and Trakt has no
-separate later season, those later entries are chained on in order.
+1. **[anibridge-mappings](https://github.com/anibridge/anibridge-mappings)**: explicit TMDB episode
+   ranges to MAL episode ranges, rebuilt daily. For example, TMDB season 1, episodes 26-38 of
+   Re:Zero are episodes 1-13 of MAL's "2nd Season".
+2. **Air dates**: the episode belongs to the one MAL entry of the show whose airing window holds
+   its air date. Its rank among that season's episodes in the window is its MAL episode number.
+   This catches what the mappings miss or get wrong, such as a new cour that TMDB appended to
+   season 1, or an OVA released on a given day.
+3. **[Fribb/anime-lists](https://github.com/Fribb/anime-lists)**: TMDB season + episode offset. When
+   episodes run past a season's last entry and Trakt has no separate later season, the later
+   seasons' entries are chained on in order.
 
-What the mapping cannot resolve is reported as *Not mapped*. Fix those with an overrides file (see
+The mappings are downloaded once a week and cached. Each run also reads the full episode list of
+every anime show you watched, for the air dates.
+
+A finished MAL entry counts as completed when you have watched every Trakt episode that maps to
+it, even if MAL counts one or two more. MAL often lists a bonus episode that TMDB files as a
+special, as with K-On!: 12 episodes on TMDB, 13 on MAL.
+
+Anything still unresolved is reported as *Not mapped*. Fix those with an overrides file (see
 [overrides.example.json](overrides.example.json)):
 
 ```json
@@ -54,8 +68,8 @@ What the mapping cannot resolve is reported as *Not mapped*. Fix those with an o
 }
 ```
 
-`tv` entries replace the mapping for that TMDB season; `offset` is the number of episodes before
-the MAL entry starts. `skip_mal` lists MAL ids the sync must never touch.
+`tv` entries replace both mappings for that TMDB season; `offset` is the number of episodes
+before the MAL entry starts. `skip_mal` lists MAL ids the sync must never touch.
 
 ## Setup
 
@@ -124,8 +138,8 @@ Process environment variables win over the `--config` file.
 | File | |
 |---|---|
 | `mal_token.json` | MAL access and refresh token (`0600`) |
-| `anime-list-full.json` | cached mapping, refreshed after 6 days |
-| `mal_anime.json` | cached MAL episode counts and airing status |
+| `anime-list-full.json`, `anibridge-mappings.json` | cached mappings, refreshed after 6 days |
+| `mal_anime.json` | cached MAL episode counts, types, airing status and dates |
 | `last-run.txt` | the last run's full log |
 | `unmapped-seen.json` | unmapped items already reported, so Telegram only shows new ones |
 | `overrides.json` | optional mapping fixes |
@@ -134,14 +148,17 @@ Process environment variables win over the `--config` file.
 
 - Dropped and on-hold shows on Trakt are not visible without OAuth, so they are not synced.
 - Rewatch counts are not synced.
-- Specials (season 0) only map when the mapping places them unambiguously; movies are matched by
-  their TMDB movie id instead.
+- Specials (season 0) map through anibridge or their release date; movies are matched by their
+  TMDB movie id.
+- An episode with no air date on TMDB can only be placed by the two mappings.
 - A Trakt show without a TMDB id cannot be matched.
 
 ## Credits
 
-Anime mapping by [Fribb/anime-lists](https://github.com/Fribb/anime-lists), built on
-[Anime-Lists/anime-lists](https://github.com/Anime-Lists/anime-lists). Not affiliated with Trakt or
+Anime mappings by [anibridge/anibridge-mappings](https://github.com/anibridge/anibridge-mappings)
+(MIT) and [Fribb/anime-lists](https://github.com/Fribb/anime-lists), both built on
+[Anime-Lists/anime-lists](https://github.com/Anime-Lists/anime-lists) and
+[manami-project/anime-offline-database](https://github.com/manami-project/anime-offline-database). Not affiliated with Trakt or
 MyAnimeList.
 
 ## License
