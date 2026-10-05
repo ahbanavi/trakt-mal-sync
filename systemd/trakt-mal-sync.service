@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync Trakt.tv history to MyAnimeList
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/trakt-mal-sync/trakt_mal_sync.py --config /etc/trakt-mal-sync.env sync --apply
+StateDirectory=trakt-mal-sync
+StateDirectoryMode=0700
+TimeoutStartSec=30min
+Nice=10

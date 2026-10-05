@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# real configs and state hold tokens
+*.env
+!config.example.env
+overrides.json
+mal_token.json
+mal_pkce.json

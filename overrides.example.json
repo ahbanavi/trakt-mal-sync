@@ -1,0 +1,9 @@
+{
+  "tv": [
+    {"tmdb": 1429, "season": 1, "offset": 0, "mal_id": 16498}
+  ],
+  "movies": [
+    {"tmdb": 128, "mal_id": 164}
+  ],
+  "skip_mal": []
+}
