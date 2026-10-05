@@ -50,6 +50,17 @@ that knows it:
    episodes run past a season's last entry and Trakt has no separate later season, the later
    seasons' entries are chained on in order.
 
+Rules that keep the sources from overruling each other:
+
+- anibridge only counts for seasons Trakt actually has. TMDB often folds a later season into
+  season 1 after a mapping was made, which leaves the mapping's season 2 empty on Trakt.
+- Air dates step aside when two MAL entries' windows overlap on the episode's date, or when
+  anibridge maps that MAL entry within the same season. The episode then falls through to Fribb.
+- Air-date candidates are every MAL entry either mapping links to the show, by TMDB or TVDB id.
+  Regular episodes only match TV and ONA entries; specials (season 0) match OVAs, specials,
+  ONAs and movies. Dates are compared in Japanese time with a day of slack, and entries not yet
+  aired are skipped.
+
 The mappings are downloaded once a week and cached. Each run also reads the full episode list of
 every anime show you watched, for the air dates.
 
